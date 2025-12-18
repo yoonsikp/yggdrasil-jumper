@@ -1,7 +1,10 @@
 use std::io::{ErrorKind, IoSlice, Write};
 use tracing::{debug, warn};
+use circular_buffer::CircularBuffer;
 
 use crate::IoResult;
+
+const FRAG_BUF_SIZE: usize = 1<<18;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Varint {
@@ -10,30 +13,42 @@ enum Varint {
     Invalid,
 }
 
-/// See https://protobuf.dev/programming-guides/encoding/#varints
 fn decode_varint(buf: &[u8]) -> Varint {
-    const VARINT_MAX_LEN: usize = 9;
+    const VARINT_MAX_LEN: usize = 10;
+
     let mut value: u64 = 0;
+
     for i in 0..VARINT_MAX_LEN {
-        let Some(e) = buf.get(i).cloned() else {
+        let Some(&byte) = buf.get(i) else {
             debug!("Varint truncated");
             return Varint::Truncated;
         };
-        value |= (e as u64 & 0x7f) << (i * 7);
-        if e & 0x80 == 0 {
+
+        let bits = (byte & 0x7f) as u64;
+
+        // Prevent overflow / invalid encodings
+        if i == 9 && bits > 1 {
+            debug!("Not a valid u64 varint (overflow)");
+            return Varint::Invalid;
+        }
+
+        value |= bits << (i * 7);
+
+        if byte & 0x80 == 0 {
             return Varint::Ok {
                 value,
                 varint_len: i + 1,
             };
         }
     }
-    debug!("Not a varint");
+
+    debug!("Not a varint (too long)");
     Varint::Invalid
 }
 
 enum Packet {
     /// Packet analysis failed, should abort here
-    Invalid,
+    Invalid(),
     /// Need few more bytes
     TruncatedHeader,
     /// Packet not fits in the buffer.
@@ -44,6 +59,7 @@ enum Packet {
     Traffic(usize),
     /// Packet should be sent over a reliable channel
     Meta(usize),
+    MetaInit(usize),
 }
 
 impl Packet {
@@ -54,6 +70,7 @@ impl Packet {
 
 /// Yggdrasil has a simple packet encoding, it starts with a varint containing packet size,
 /// followed by a single byte for packet type
+
 fn parse_yggdrasil_packet(buf: &[u8]) -> Packet {
     // Meta the first packet sent in the connection
     if buf.starts_with(b"meta") {
@@ -62,7 +79,7 @@ fn parse_yggdrasil_packet(buf: &[u8]) -> Packet {
         }
         let len = 6 + u16::from_be_bytes([buf[4], buf[5]]) as usize;
         return if len <= buf.len() {
-            Packet::Meta(len)
+            Packet::MetaInit(len)
         } else {
             Packet::Truncated(len)
         };
@@ -71,7 +88,7 @@ fn parse_yggdrasil_packet(buf: &[u8]) -> Packet {
     let (len, var_len) = match decode_varint(buf) {
         Varint::Ok { value, varint_len } => (value as usize, varint_len),
         Varint::Truncated => return Packet::TruncatedHeader,
-        Varint::Invalid => return Packet::Invalid,
+        Varint::Invalid => return Packet::Invalid(),
     };
 
     // TODO: sanity check length
@@ -79,7 +96,55 @@ fn parse_yggdrasil_packet(buf: &[u8]) -> Packet {
         return Packet::Truncated(var_len + len);
     }
     let Some(&packet_type) = buf.get(var_len) else {
-        return Packet::Invalid;
+        return Packet::Invalid();
+    };
+
+    debug!("Received packet type is {packet_type}");
+
+    // https://github.com/Arceliar/ironwood/blob/main/network/wire.go
+    let to_bypass = match packet_type {
+        // 0 => true, // dummy
+        // 1 => true, // keep alive
+        9 => true, // traffic
+        _ => false,
+    };
+
+    if to_bypass {
+        Packet::Traffic(var_len + len)
+    } else {
+        Packet::Meta(var_len + len)
+    }
+}
+
+
+fn parse_yggdrasil_packet_circ(meta_seen: bool, buf: &CircularBuffer<FRAG_BUF_SIZE, u8>) -> Packet {
+    // Meta the first packet sent in the connection
+    if buf.len() < 6{
+        return Packet::TruncatedHeader;
+    }
+    let mut iter = buf.iter().copied(); 
+    let header: Vec<u8>  = iter.by_ref().take(4).collect();
+    if header == b"meta" {
+        let len = 6 + u16::from_be_bytes([buf[4], buf[5]]) as usize;
+        return if len <= buf.len() {
+            Packet::MetaInit(len)
+        } else {
+            Packet::Truncated(len)
+        };
+    }
+    let mut iter = buf.iter().copied(); 
+    let header: Vec<u8> = iter.by_ref().take(10).collect();
+    let (len, var_len) = match decode_varint(&header) {
+        Varint::Ok { value, varint_len } => (value as usize, varint_len),
+        Varint::Truncated => return Packet::TruncatedHeader,
+        Varint::Invalid => return Packet::Invalid(),
+    };
+
+    if var_len + len > buf.len() {
+        return Packet::Truncated(var_len + len);
+    }
+    let Some(&packet_type) = buf.get(var_len) else {
+        return Packet::Invalid();
     };
 
     debug!("Received packet type is {packet_type}");
@@ -101,12 +166,16 @@ fn parse_yggdrasil_packet(buf: &[u8]) -> Packet {
 
 #[derive(Default)]
 pub struct SendLossy {
+// if skip == -1 then we have an unknown amount of truncated packet
     pub skip: usize,
     pub udp_mtu: usize,
     pub fallback_to_reliable: bool,
     pub permanent_fallback: bool,
+    pub fragmentbuffer: CircularBuffer<FRAG_BUF_SIZE, u8>,
+    pub meta_seen: bool,
 }
-
+/// end_read: non-inclusive
+///
 impl SendLossy {
     /// Returns amount of bytes left at the beginning of the buffer
     pub fn send(
@@ -115,60 +184,46 @@ impl SendLossy {
         peer: &std::net::UdpSocket,
         kcp: &mut kcp::Kcp<impl Write>,
     ) -> IoResult<usize> {
-        let mut to_write = &send[..];
-
+        let _ = self.fragmentbuffer.write_all(&send);
+        
         if self.permanent_fallback {
             return self.recover(send, kcp);
         }
 
-        while !to_write.is_empty() {
-            if self.skip != 0 {
-                let to_skip = self.skip.min(to_write.len());
-                self.skip = match self.skip.checked_sub(to_skip) {
-                    Some(skip) => skip,
-                    None => return self.recover(to_write, kcp),
-                };
-
-                let sent = kcp.send(&to_write[..to_skip])?;
-                assert_eq!(sent, to_skip);
-
-                to_write = &to_write[to_skip..];
-                debug!("Skipped {} bytes, {} remaining", to_skip, self.skip);
-            }
-
-            while !to_write.is_empty() && self.skip == 0 {
-                match parse_yggdrasil_packet(to_write) {
-                    Packet::Invalid => return self.recover(to_write, kcp),
-                    Packet::TruncatedHeader => {
-                        debug!("Truncated header");
-                        let len = to_write.len();
-                        let range = (send.len() - len)..;
-                        send.copy_within(range, 0);
-
-                        return Ok(len);
-                    }
-                    Packet::Traffic(len) if len <= self.udp_mtu => {
-                        debug!("Sending {} bytes via shortcut", len);
-                        let sent = peer.send(&to_write[..len])?;
-                        assert_eq!(sent, len);
-                        to_write = &to_write[len..];
-                    }
-                    // IP spec mandates to emit a destination-unreachable icmp packet though
-                    Packet::Traffic(len) if !self.fallback_to_reliable => {
-                        debug!("Ignoring {} bytes (fallback disabled)", len);
-                        to_write = &to_write[len..];
-                    }
-                    Packet::Meta(len) | Packet::Traffic(len) => {
-                        debug!("Sending {} bytes backed up", len);
-                        let sent = kcp.send(&to_write[..len])?;
-                        assert_eq!(sent, len);
-                        to_write = &to_write[len..];
-                    }
-                    Packet::Truncated(len) => {
-                        debug!("Too long {} bytes", len);
-                        self.skip += len;
-                    }
+        while !self.fragmentbuffer.is_empty() {
+            match parse_yggdrasil_packet_circ(self.meta_seen, &self.fragmentbuffer) {
+                Packet::Invalid() => {
+                    debug!("Invalid packet");
+                    return Ok(0);
                 }
+                Packet::TruncatedHeader => {
+                    debug!("Truncated header");
+                    return Ok(0);
+                }
+                Packet::Truncated(len) => {
+                    debug!("Too long {} bytes", len);
+                    return Ok(0);
+                }
+                Packet::Traffic(len) if len <= self.udp_mtu => {
+                    debug!("Sending {} bytes via shortcut", len);
+                    let drained = self.fragmentbuffer.drain(..len).collect::<Vec<u8>>();
+                    let sent = peer.send(&drained)?;
+                    assert_eq!(sent, len);
+                }
+                Packet::MetaInit(len) => {
+                    debug!("Sending {} bytes backed up", len);
+                    self.meta_seen = true;
+                    let drained = self.fragmentbuffer.drain(..len).collect::<Vec<u8>>();
+                    let sent = kcp.send(&drained)?;
+                    assert_eq!(sent, len);
+                }
+                Packet::Meta(len) | Packet::Traffic(len) => {
+                    debug!("Sending {} bytes backed up", len);
+                    let drained = self.fragmentbuffer.drain(..len).collect::<Vec<u8>>();
+                    let sent = kcp.send(&drained)?;
+                    assert_eq!(sent, len);
+                }
+
             }
         }
 
@@ -205,6 +260,7 @@ impl ReceiveLossy {
         if recv.starts_with(&self.peer_conv.to_le_bytes())
             || !parse_yggdrasil_packet(recv).is_traffic()
         {
+            debug!("Received {} BAD bytes via shortcut", recv.len());
             return Ok(false);
         }
 
@@ -247,7 +303,7 @@ impl ReceiveLossy {
 
             while to_flush != to_write.len() && self.skip == 0 {
                 match parse_yggdrasil_packet(&to_write[to_flush..]) {
-                    Packet::Invalid => return self.recover(to_write, ygg),
+                    Packet::Invalid() => return self.recover(to_write, ygg),
                     Packet::TruncatedHeader => {
                         ygg.write_all(&to_write[..to_flush])?;
 
@@ -257,7 +313,7 @@ impl ReceiveLossy {
 
                         return Ok(len);
                     }
-                    Packet::Traffic(len) | Packet::Meta(len) => {
+                    Packet::Traffic(len) | Packet::Meta(len) | Packet::MetaInit(len) => {
                         debug!("Sending packet {} bytes", len);
                         to_flush += len;
                         if !self.backlog.is_empty() {

@@ -189,12 +189,7 @@ pub async fn spawn_new_sessions(
                     }
                 }
 
-                // Skip if peer is already has direct connection
-                if let Some(ref peers) = peers {
-                    if peers.iter().any(|p| p.address.as_ref() == Some(&addr)) {
-                        continue;
-                    }
-                }
+
 
                 // Skip if session already tracked
                 if sessions.get(&addr).is_some() {
