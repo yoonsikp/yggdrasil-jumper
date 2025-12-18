@@ -15,9 +15,10 @@ use crate::{
     State,
 };
 
-const STACK_SIZE: usize = 128 * 1024;
+const STACK_SIZE: usize = 4 * 1024 * 1024;
 
-const BUF_SIZE: usize = 1 << 14;
+const BUF_SIZE: usize = 1 << 17;
+
 
 struct KcpWriter<F: FnMut(usize)>(Arc<std::net::UdpSocket>, Option<F>);
 
@@ -74,7 +75,7 @@ pub async fn setup_proxy_tcp(
     // so we should avoid introducing even more delay
     let nodelay = true;
 
-    let congestion_control = true;
+    let congestion_control = false;
 
     kcp.set_nodelay(nodelay, interval as i32, 0, congestion_control);
 
@@ -91,7 +92,7 @@ pub async fn setup_proxy_tcp(
     let err_set_timeout = map_warn!("Error setting read timeout");
     let err_dup = map_warn!("Error duplicating socket");
     let err_spawn_thread = map_warn!("Error spawning new thread");
-
+    
     let direction = "TCP -> UDP";
     let tx = std::thread::Builder::new()
         .name(direction.into())
@@ -102,7 +103,7 @@ pub async fn setup_proxy_tcp(
             let kcp = kcp.clone();
             let mut ygg = ygg.try_clone().map_err(err_dup)?;
             let peer = peer.clone();
-
+            
             let mut last_timeout_ms: u32 = 10;
             ygg.set_read_timeout(Some(Duration::from_millis(last_timeout_ms as u64)))
                 .map_err(err_set_timeout)?;
@@ -119,7 +120,6 @@ pub async fn setup_proxy_tcp(
                 let _span = _span.enter();
                 let mut buf = Box::new([0u8; BUF_SIZE]);
                 let mut left = 0;
-
                 let mut send_lossy = yggdrasil_dpi::SendLossy {
                     udp_mtu,
                     fallback_to_reliable,
